@@ -190,6 +190,47 @@ to a `BETWEEN` over the dashboard's time picker.
 
 ---
 
+## Building the ingest service image standalone
+
+The microservice has its own multi-stage Dockerfile at
+[`ingest/Dockerfile`](../ingest/Dockerfile). It uses [`uv`](https://github.com/astral-sh/uv)
+to install from `pyproject.toml` + `uv.lock` (reproducible), then copies the
+resulting venv and application into a slim runtime layer that runs as a
+non-root user.
+
+Build it on its own (no compose needed):
+
+```bash
+docker build -t timescale-lo-ingest:latest ingest/
+```
+
+Run it against an externally-managed TimescaleDB:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e TSDB_HOST=<your-db-host> \
+  -e TSDB_PORT=5432 \
+  -e TSDB_USER=tsdbadmin \
+  -e TSDB_PASSWORD=tsdbpass \
+  -e TSDB_DATABASE=metrics \
+  timescale-lo-ingest:latest
+```
+
+If your TimescaleDB is the one launched by this repo's `docker compose`, join
+its network:
+
+```bash
+docker network ls | grep tsnet                            # find the network
+docker run --rm -p 8080:8080 --network timescale-lo_tsnet \
+  -e TSDB_HOST=timescaledb -e TSDB_USER=tsdbadmin \
+  -e TSDB_PASSWORD=tsdbpass -e TSDB_DATABASE=metrics \
+  timescale-lo-ingest:latest
+```
+
+Then write line protocol exactly as in layer 3 below.
+
+---
+
 ## Layer 3 — Add the line-protocol ingest service
 
 ```bash
