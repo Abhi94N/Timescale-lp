@@ -1,4 +1,4 @@
-# timescale-lo
+# timescale-lp
 
 A small, performance-focused stack for ingesting **InfluxDB line protocol**
 into **TimescaleDB hypertables**, with **Grafana** pre-wired for querying.
