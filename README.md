@@ -38,13 +38,18 @@ expresses updates in this service — matching InfluxDB semantics.
 
 ---
 
+> Want to use just the database (no microservice) or just DB + Grafana? See
+> [`docs/timescaledb.md`](docs/timescaledb.md) for a layered walkthrough.
+
 ## Repository layout
 
 ```
 .
 ├── docker-compose.yml          # TimescaleDB + ingest + Grafana
+├── docs/timescaledb.md         # Layered walkthrough (DB → DB+Grafana → full stack)
 ├── init-db/                    # SQL run on first DB boot (creates extension + schema)
-├── grafana/provisioning/       # Auto-wires the TimescaleDB datasource
+├── grafana/provisioning/       # Auto-wires the TimescaleDB datasource + dashboards
+├── grafana/dashboards/         # Starter dashboards loaded by provisioning
 ├── ingest/                     # Python microservice
 │   ├── app/
 │   │   ├── api.py              # FastAPI routes
