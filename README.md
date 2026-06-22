@@ -24,17 +24,24 @@ into **TimescaleDB hypertables**, with **Grafana** pre-wired for querying.
 
 The microservice speaks a small **InfluxDB-compatible HTTP API**:
 
-| Verb | Path                 | Purpose                                    |
-| ---- | -------------------- | ------------------------------------------ |
-| POST | `/api/v1/write`      | Ingest line protocol (and **update** rows) |
-| POST | `/api/v1/query`      | Run SQL, get JSON                          |
-| GET  | `/api/v1/query`      | Run SQL via querystring                    |
-| POST | `/api/v1/delete`     | Delete by measurement/tags/time            |
-| GET  | `/health`            | Liveness + queue/throughput stats          |
+| Verb | Path                 | Purpose                                          |
+| ---- | -------------------- | ------------------------------------------------ |
+| POST | `/api/v1/write`      | Ingest line protocol (and **update** rows)       |
+| POST | `/api/v1/query`      | Run SQL, get JSON (`?tier=hot\|cold\|all`)        |
+| GET  | `/api/v1/query`      | Run SQL via querystring (`?tier=…`)              |
+| POST | `/api/v1/delete`     | Delete by measurement/tags/time                  |
+| POST | `/api/v1/tier/run`   | Move chunks older than a window to cold storage  |
+| GET  | `/api/v1/tier/status`| Cold-storage manifest summary                    |
+| GET  | `/health`            | Liveness + queue/throughput stats                |
 
 Re-sending the same `(measurement, tag-set, timestamp)` performs an **UPSERT**
 (via `ON CONFLICT (time, tag_hash) DO UPDATE`), which is how line protocol
 expresses updates in this service — matching InfluxDB semantics.
+
+**Tiered storage:** TimescaleDB is the hot cache; data older than
+`TIER_HOT_WINDOW` is aged out to **Parquet on S3/MinIO** and queried
+transparently via DuckDB with `?tier=all`. See
+[the tiered-storage section](docs/timescaledb.md#tiered-storage--timescaledb-hot--parquet-on-s3minio-cold).
 
 ---
 
@@ -45,8 +52,8 @@ expresses updates in this service — matching InfluxDB semantics.
 
 ```
 .
-├── docker-compose.yml          # TimescaleDB + ingest + Grafana
-├── docs/timescaledb.md         # Layered walkthrough (DB → DB+Grafana → full stack)
+├── docker-compose.yml          # TimescaleDB + ingest + Grafana + MinIO
+├── docs/timescaledb.md         # Layered walkthrough + tiered-storage guide
 ├── init-db/                    # SQL run on first DB boot (creates extension + schema)
 ├── grafana/provisioning/       # Auto-wires the TimescaleDB datasource + dashboards
 ├── grafana/dashboards/         # Starter dashboards loaded by provisioning
@@ -56,8 +63,10 @@ expresses updates in this service — matching InfluxDB semantics.
 │   │   ├── batcher.py          # Per-worker batching writer
 │   │   ├── config.py           # pydantic-settings
 │   │   ├── lineproto.py        # Line protocol parser
-│   │   ├── main.py             # uvicorn entrypoint
-│   │   └── store.py            # Schema mgmt + binary COPY upserts
+│   │   ├── store.py            # Schema mgmt + binary COPY upserts
+│   │   ├── engine.py           # DuckDB: PG↔Parquet export + federated query
+│   │   ├── tiering.py          # Hot→cold tierer + manifest
+│   │   └── main.py             # uvicorn entrypoint
 │   ├── tests/
 │   ├── pyproject.toml          # uv + ruff config
 │   └── Dockerfile              # uv-based slim image
@@ -80,11 +89,12 @@ make ps
 
 Services:
 
-| Service     | URL                          | Notes                                      |
-| ----------- | ---------------------------- | ------------------------------------------ |
-| Ingest API  | http://localhost:8080        | `/health`, `/api/v1/*`                     |
-| Grafana     | http://localhost:3000        | login `admin` / `admin` (overridable)      |
-| TimescaleDB | postgres://localhost:5432    | `tsdbadmin` / `tsdbpass` / db `metrics`    |
+| Service       | URL                          | Notes                                      |
+| ------------- | ---------------------------- | ------------------------------------------ |
+| Ingest API    | http://localhost:8080        | `/health`, `/api/v1/*`                     |
+| Grafana       | http://localhost:3000        | login `admin` / `admin` (overridable)      |
+| TimescaleDB   | postgres://localhost:5432    | `tsdbadmin` / `tsdbpass` / db `metrics`    |
+| MinIO console | http://localhost:9001        | `minioadmin` / `minioadmin`; cold Parquet  |
 
 Tear down:
 

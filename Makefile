@@ -1,4 +1,4 @@
-.PHONY: help up down logs ps restart rebuild test lint fmt fmt-check dev write query
+.PHONY: help up down reset logs ps restart rebuild test lint fmt fmt-check dev write query tier tier-status query-all
 
 help:
 	@echo "Targets:"
@@ -13,7 +13,10 @@ help:
 	@echo "  lint        - ruff lint + format check"
 	@echo "  fmt         - ruff format + autofix"
 	@echo "  write       - send a sample line-protocol payload"
-	@echo "  query       - run a sample SQL query"
+	@echo "  query       - run a sample SQL query (hot tier)"
+	@echo "  query-all   - sample query across hot + cold (federated)"
+	@echo "  tier        - force a tiering pass (older_than 1 hour)"
+	@echo "  tier-status - show the cold-storage manifest summary"
 
 up:
 	docker compose up -d --build
@@ -51,5 +54,20 @@ write:
 
 query:
 	curl -fsS -X POST http://localhost:8080/api/v1/query \
+	  -H 'content-type: application/json' \
+	  -d '{"sql":"SELECT count(*) AS n FROM lp.cpu"}'
+
+# Force a tiering pass for anything older than 1 hour (demo).
+tier:
+	curl -fsS -X POST http://localhost:8080/api/v1/tier/run \
+	  -H 'content-type: application/json' \
+	  -d '{"older_than":"1 hour"}'
+
+tier-status:
+	curl -fsS http://localhost:8080/api/v1/tier/status
+
+# Count rows across hot + cold via the federated DuckDB path.
+query-all:
+	curl -fsS -X POST 'http://localhost:8080/api/v1/query?tier=all' \
 	  -H 'content-type: application/json' \
 	  -d '{"sql":"SELECT count(*) AS n FROM lp.cpu"}'

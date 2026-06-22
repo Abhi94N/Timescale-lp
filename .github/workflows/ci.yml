@@ -74,6 +74,20 @@ jobs:
             -H 'content-type: application/json' \
             -d '{"sql":"SELECT count(*) AS n FROM lp.cpu"}'
 
+      - name: Smoke tiering (hot -> cold -> federated)
+        run: |
+          set -euo pipefail
+          # The 2020 row above is well older than any window; tier it out.
+          curl -fsS -X POST http://localhost:8080/api/v1/tier/run \
+            -H 'content-type: application/json' -d '{"older_than":"1 hour"}'
+          # Federated count must still see the tiered row.
+          ALL=$(curl -fsS -X POST 'http://localhost:8080/api/v1/query?tier=all' \
+            -H 'content-type: application/json' \
+            -d '{"sql":"SELECT count(*) AS n FROM lp.cpu"}')
+          echo "federated: $ALL"
+          echo "$ALL" | grep -q '"n": *[1-9]'
+          curl -fsS http://localhost:8080/api/v1/tier/status
+
       - name: Dump logs on failure
         if: failure()
         run: docker compose logs --no-color | tail -500

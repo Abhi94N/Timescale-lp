@@ -13,12 +13,15 @@ from pydantic import BaseModel, Field
 
 from .batcher import Batcher
 from .config import settings
+from .engine import DuckEngine
 from .lineproto import parse_batch
 from .store import Store
+from .tiering import Tierer
 
 log = logging.getLogger(__name__)
 
 PRECISIONS = {"ns", "us", "ms", "s"}
+TIERS = {"hot", "cold", "all"}
 
 
 class WriteResult(BaseModel):
@@ -39,6 +42,11 @@ class DeleteRequest(BaseModel):
     end: datetime | None = None
 
 
+class TierRunRequest(BaseModel):
+    older_than: str | None = None
+    measurement: str | None = None
+
+
 def _normalize_dt(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
@@ -57,17 +65,39 @@ def create_app() -> FastAPI:
         await batcher.start()
         state["store"] = store
         state["batcher"] = batcher
+
+        engine: DuckEngine | None = None
+        tierer: Tierer | None = None
+        if settings.query_engine_enabled or settings.tier_enabled:
+            try:
+                engine = await DuckEngine.connect()
+                tierer = Tierer(store, engine)
+                await tierer.ensure_manifest()
+                await tierer.start()
+            except Exception:
+                log.exception("query/tiering engine unavailable; running hot-only")
+                engine = None
+                tierer = None
+        state["engine"] = engine
+        state["tierer"] = tierer
+
         log.info(
-            "ingest started: pool=%s..%s workers=%s batch=%s/%sms",
+            "ingest started: pool=%s..%s workers=%s batch=%s/%sms engine=%s tierer=%s",
             settings.ingest_pool_min,
             settings.ingest_pool_max,
             settings.ingest_workers,
             settings.ingest_batch_size,
             settings.ingest_batch_flush_ms,
+            engine is not None,
+            settings.tier_enabled,
         )
         try:
             yield
         finally:
+            if tierer is not None:
+                await tierer.stop()
+            if engine is not None:
+                await engine.close()
             await batcher.stop()
             await store.close()
 
@@ -122,11 +152,34 @@ def create_app() -> FastAPI:
             return Response(status_code=204)
         return ORJSONResponse(payload.model_dump(), status_code=status)
 
+    async def _run_query(sql: str, params: list[object], tier: str) -> list[dict]:
+        if tier not in TIERS:
+            raise HTTPException(400, f"invalid tier; expected one of {sorted(TIERS)}")
+        if tier == "hot":
+            store: Store = state["store"]  # type: ignore[assignment]
+            return await store.query_json(sql, params)
+
+        # Federated path (cold-only or hot+cold) via DuckDB.
+        engine: DuckEngine | None = state.get("engine")  # type: ignore[assignment]
+        tierer: Tierer | None = state.get("tierer")  # type: ignore[assignment]
+        if engine is None or tierer is None:
+            raise HTTPException(
+                503, "federated query engine is disabled (set QUERY_ENGINE_ENABLED=true)"
+            )
+        if params:
+            raise HTTPException(400, "parameterized queries are only supported for tier=hot")
+        include_hot = tier == "all"
+        include_cold = tier in ("all", "cold")
+        specs = await tierer.view_specs(include_hot=include_hot, include_cold=include_cold)
+        await engine.register_views(specs)
+        return await engine.query_rows(sql)
+
     @app.post("/api/v1/query")
-    async def query(req: QueryRequest) -> Response:
-        store: Store = state["store"]  # type: ignore[assignment]
+    async def query(req: QueryRequest, tier: str = Query("hot")) -> Response:
         try:
-            rows = await store.query_json(req.sql, req.params)
+            rows = await _run_query(req.sql, req.params, tier)
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(400, f"query error: {exc}") from exc
         return Response(
@@ -134,15 +187,50 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/v1/query")
-    async def query_get(sql: str = Query(...)) -> Response:
-        store: Store = state["store"]  # type: ignore[assignment]
+    async def query_get(sql: str = Query(...), tier: str = Query("hot")) -> Response:
         try:
-            rows = await store.query_json(sql, [])
+            rows = await _run_query(sql, [], tier)
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(400, f"query error: {exc}") from exc
         return Response(
             content=orjson.dumps(rows, default=_default_json), media_type="application/json"
         )
+
+    @app.post("/api/v1/tier/run")
+    async def tier_run(req: TierRunRequest) -> dict:
+        tierer: Tierer | None = state.get("tierer")  # type: ignore[assignment]
+        if tierer is None:
+            raise HTTPException(503, "tiering is disabled (set QUERY_ENGINE_ENABLED=true)")
+        try:
+            results = await tierer.run_once(req.older_than, req.measurement)
+        except Exception as exc:
+            raise HTTPException(400, f"tiering error: {exc}") from exc
+        return {
+            "moved": len(results),
+            "chunks": [
+                {
+                    "measurement": r.measurement,
+                    "object_key": r.object_key,
+                    "range_start": r.range_start.isoformat(),
+                    "range_end": r.range_end.isoformat(),
+                    "rows": r.rows,
+                }
+                for r in results
+            ],
+        }
+
+    @app.get("/api/v1/tier/status")
+    async def tier_status() -> dict:
+        tierer: Tierer | None = state.get("tierer")  # type: ignore[assignment]
+        if tierer is None:
+            raise HTTPException(503, "tiering is disabled (set QUERY_ENGINE_ENABLED=true)")
+        return {
+            "enabled": settings.tier_enabled,
+            "hot_window": settings.tier_hot_window,
+            "cold": await tierer.status(),
+        }
 
     @app.post("/api/v1/delete")
     async def delete(req: DeleteRequest) -> dict:

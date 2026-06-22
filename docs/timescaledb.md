@@ -368,6 +368,120 @@ service later still without re-creating tables.
 
 ---
 
+## Tiered storage — TimescaleDB (hot) + Parquet on S3/MinIO (cold)
+
+TimescaleDB is treated as a **hot cache** for recent data. Older data is
+moved out into **Parquet objects** on S3-compatible storage (MinIO in the
+compose stack), which is far cheaper per byte and independently scalable.
+Queries can transparently span both tiers.
+
+```
+        writes (line protocol)
+                │
+                ▼
+       ┌─────────────────┐    age out chunks    ┌──────────────────────┐
+       │  TimescaleDB    │  ───────────────────▶ │  Parquet on S3/MinIO │
+       │  (hot, recent)  │     (tierer)          │  (cold, historical)  │
+       └────────┬────────┘                       └───────────┬──────────┘
+                │                                            │
+                │            DuckDB federation               │
+                └──────────────────┬─────────────────────────┘
+                                   ▼
+                     /api/v1/query?tier=all   (hot ∪ cold)
+```
+
+### How it works
+
+- **Write path is unchanged** — points always land in TimescaleDB first.
+- A **tierer** finds hypertable chunks whose time range is entirely older
+  than `TIER_HOT_WINDOW`, and for each one (oldest first):
+  1. `COPY (SELECT * FROM pg.lp.<table> WHERE time in [chunk]) TO
+     's3://…/<table>/<start>.parquet'` via **DuckDB** (streams Postgres →
+     Parquet without round-tripping through Python),
+  2. records the object in the `lp._cold_chunks` manifest,
+  3. drops the chunk from TimescaleDB.
+- **Queries** run through **DuckDB**, which `ATTACH`es TimescaleDB and reads
+  Parquet from S3. Each measurement is exposed as a view that
+  `UNION ALL BY NAME`s the hot table with its cold Parquet objects.
+
+This is fully self-hosted and portable — point `S3_ENDPOINT` at AWS S3,
+Cloudflare R2, Backblaze B2, or any S3-compatible store and nothing else
+changes.
+
+### Query tiers
+
+`/api/v1/query` takes a `tier` parameter:
+
+| `tier`        | Source                         | Engine     | Notes                                     |
+| ------------- | ------------------------------ | ---------- | ----------------------------------------- |
+| `hot` (default) | TimescaleDB only             | Postgres   | Full Timescale SQL (`time_bucket`, etc.); supports `params` |
+| `cold`        | Parquet only                   | DuckDB     | Historical data only                      |
+| `all`         | TimescaleDB ∪ Parquet          | DuckDB     | Transparent across both tiers             |
+
+> DuckDB also has `time_bucket(interval, ts)`, so the common downsampling
+> queries work under `tier=all`/`cold` too. Timescale-only hyperfunctions do
+> not — use `tier=hot` for those.
+
+### Try it
+
+The hot window defaults to 7 days, so to see tiering immediately, trigger a
+pass with a tiny window. (Send some data with old timestamps first.)
+
+```bash
+# write a point dated well in the past
+curl -X POST 'http://localhost:8080/api/v1/write?sync=true' \
+  --data-binary 'cpu,host=a value=0.5 1577836800000000000'   # 2020-01-01
+
+# force a tiering pass for anything older than 1 hour
+curl -X POST http://localhost:8080/api/v1/tier/run \
+  -H 'content-type: application/json' \
+  -d '{"older_than": "1 hour"}'
+# {"moved": 1, "chunks": [{"measurement":"cpu","object_key":"cpu/20200101T000000Z.parquet",...}]}
+
+# the row is gone from the hot tier ...
+curl -s -X POST 'http://localhost:8080/api/v1/query?tier=hot' \
+  -H 'content-type: application/json' -d '{"sql":"SELECT count(*) n FROM lp.cpu"}'
+# [{"n": 0}]
+
+# ... but still queryable across both tiers
+curl -s -X POST 'http://localhost:8080/api/v1/query?tier=all' \
+  -H 'content-type: application/json' -d '{"sql":"SELECT count(*) n FROM lp.cpu"}'
+# [{"n": 1}]
+
+# tiering manifest summary
+curl -s http://localhost:8080/api/v1/tier/status
+```
+
+Browse the cold objects in the MinIO console at <http://localhost:9001>
+(`minioadmin` / `minioadmin`).
+
+### Configuration
+
+| Variable                | Default              | Effect                                              |
+| ----------------------- | -------------------- | --------------------------------------------------- |
+| `QUERY_ENGINE_ENABLED`  | `true`               | Enables the DuckDB federated query + tiering engine |
+| `TIER_ENABLED`          | `false`              | Runs the background tierer loop                      |
+| `TIER_HOT_WINDOW`       | `7 days`             | Data younger than this stays in TimescaleDB         |
+| `TIER_INTERVAL_SECONDS` | `3600`               | Background tierer cadence                            |
+| `S3_ENDPOINT`           | `http://minio:9000`  | S3 endpoint (swap for R2/S3/B2 in prod)             |
+| `S3_BUCKET`             | `timescale-cold`     | Cold object bucket                                   |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `minioadmin` | S3 credentials                                      |
+
+### Operational notes
+
+- **Crash safety**: exports use deterministic keys and the manifest upserts,
+  so an interrupted pass just re-does the unfinished chunk on the next run.
+- **Recovery / re-hydration**: cold data is plain Parquet. To pull a range
+  back into TimescaleDB, read it with DuckDB (or any Parquet reader) and
+  `COPY` it back into the hypertable.
+- **Compression**: cold Parquet is written with zstd. TimescaleDB native
+  compression still applies to hot chunks before they age out.
+- **Extensions**: the ingest image pre-installs DuckDB's `httpfs` and
+  `postgres` extensions at build time, so the runtime container needs no
+  network to load them.
+
+---
+
 ## Useful TimescaleDB references
 
 - Hypertables: <https://docs.timescale.com/use-timescale/latest/hypertables/>

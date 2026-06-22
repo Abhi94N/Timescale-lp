@@ -47,11 +47,17 @@ COPY app ./app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev --no-editable
 
+# Pre-download DuckDB's httpfs + postgres extensions into the image so the
+# runtime container needs no network to load them (used by the tiering/query
+# engine). Stored under the home DuckDB extension dir, copied to runtime.
+RUN /app/.venv/bin/python -c "import duckdb; c=duckdb.connect(); c.execute('INSTALL httpfs'); c.execute('INSTALL postgres')"
+
 # ---------- Stage 2: minimal runtime ----------
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/app \
     PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
@@ -64,6 +70,8 @@ RUN apt-get update \
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --from=builder --chown=app:app /app/app /app/app
+# Carry the pre-installed DuckDB extensions (downloaded as root in the builder).
+COPY --from=builder --chown=app:app /root/.duckdb /app/.duckdb
 
 USER app
 
