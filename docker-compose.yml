@@ -104,8 +104,9 @@ services:
       INGEST_WORKERS: "8"
       INGEST_POOL_MAX: "32"
       INGEST_CHUNK_INTERVAL: "1 day"
-      # Tiered storage (hot = TimescaleDB, cold = Parquet on MinIO).
+      # Tiered storage (hot = TimescaleDB write-through cache, cold = Parquet on MinIO).
       QUERY_ENGINE_ENABLED: "true"
+      WRITE_THROUGH: "${WRITE_THROUGH:-true}"
       TIER_ENABLED: "${TIER_ENABLED:-false}"
       TIER_HOT_WINDOW: "${TIER_HOT_WINDOW:-7 days}"
       TIER_INTERVAL_SECONDS: "3600"

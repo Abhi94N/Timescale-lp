@@ -1,16 +1,17 @@
 """
-Hot→cold tiering.
+Cold-tier maintenance: compaction, eviction, and federation-ref assembly.
 
-TimescaleDB is the hot cache; Parquet objects in S3/MinIO are cold storage.
-A tiering pass, per hypertable:
+With write-through on, every batch is already durable in cold staging, so the
+two background jobs are:
 
-1. Finds chunks whose time range is entirely older than the hot window.
-2. Exports each chunk (oldest first) to a Parquet object via DuckDB.
-3. Records the object in the `<schema>._cold_chunks` manifest.
-4. Drops the now-archived chunk from TimescaleDB.
+- **Compaction** merges many small staging objects into large day-partitioned
+  cold objects (deduping by seq), keeping the queryable cold tier efficient at
+  TB scale.
+- **Eviction** drops TimescaleDB chunks older than the hot window once cold
+  fully covers them — pure cache eviction, no data movement.
 
-Re-running is safe: exports overwrite the same deterministic key and the
-manifest upserts, so a crash mid-pass simply re-does the unfinished chunk.
+It also assembles the DuckDB relation refs (hot table + range-pruned cold/
+staging Parquet) that back the federated query views.
 """
 
 from __future__ import annotations
@@ -21,55 +22,154 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
+from .coldstore import KIND_COLD, KIND_STAGING, ColdStore, cold_key, day_of, select_overlapping
 from .config import settings
-from .engine import DuckEngine, cold_key
+from .engine import DuckEngine, read_parquet_ref
 from .store import Store, _quote_ident
 
 log = logging.getLogger(__name__)
 
-MANIFEST = "_cold_chunks"
-
-
-def _manifest_qualified() -> str:
-    return f"{_quote_ident(settings.tsdb_schema)}.{_quote_ident(MANIFEST)}"
-
 
 def _hot_ref(table: str) -> str:
-    """DuckDB reference to the attached Postgres hypertable."""
     return f"pg.{_quote_ident(settings.tsdb_schema)}.{_quote_ident(table)}"
 
 
+# --------------------------------------------------------------------------
+# Pure planning helpers
+# --------------------------------------------------------------------------
+
+
+def plan_compaction(staging_objects: list[dict]) -> dict[str, list[dict]]:
+    """Group staging objects by UTC day (of range_start) for merging."""
+    groups: dict[str, list[dict]] = {}
+    for o in staging_objects:
+        groups.setdefault(day_of(o["range_start"]), []).append(o)
+    return groups
+
+
+def merge_intervals(intervals: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    out: list[tuple[datetime, datetime]] = []
+    for start, end in sorted(intervals):
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def is_covered(
+    chunk_start: datetime, chunk_end: datetime, intervals: list[tuple[datetime, datetime]]
+) -> bool:
+    """Is [chunk_start, chunk_end) fully covered by the union of `intervals`?"""
+    cursor = chunk_start
+    for start, end in merge_intervals(intervals):
+        if start > cursor:
+            return False
+        if end > cursor:
+            cursor = end
+        if cursor >= chunk_end:
+            return True
+    return cursor >= chunk_end
+
+
+# --------------------------------------------------------------------------
+# Tierer
+# --------------------------------------------------------------------------
+
+
 @dataclass
-class TierResult:
+class CompactResult:
     measurement: str
+    day: str
     object_key: str
-    range_start: datetime
-    range_end: datetime
+    merged: int
     rows: int
 
 
+@dataclass
+class EvictResult:
+    measurement: str
+    range_start: datetime
+    range_end: datetime
+
+
 class Tierer:
-    def __init__(self, store: Store, engine: DuckEngine) -> None:
+    def __init__(self, store: Store, engine: DuckEngine, cold: ColdStore) -> None:
         self.store = store
         self.engine = engine
+        self.cold = cold
         self._task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
 
     async def ensure_manifest(self) -> None:
-        async with self.store.pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_manifest_qualified()} (
-                    hypertable  TEXT        NOT NULL,
-                    object_key  TEXT        NOT NULL,
-                    range_start TIMESTAMPTZ NOT NULL,
-                    range_end   TIMESTAMPTZ NOT NULL,
-                    rows        BIGINT      NOT NULL,
-                    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (hypertable, range_start)
+        await self.cold.ensure_manifest()
+
+    # ---- compaction ------------------------------------------------------
+
+    async def compact_once(self, measurement: str | None = None) -> list[CompactResult]:
+        await self.ensure_manifest()
+        measurements = [measurement] if measurement else await self.cold.measurements()
+        results: list[CompactResult] = []
+        for m in measurements:
+            staging = await self.cold.objects(m, kind=KIND_STAGING)
+            if not staging:
+                continue
+            for day, objs in plan_compaction(staging).items():
+                min_seq = min(o["min_seq"] for o in objs)
+                out_key = cold_key(m, day, min_seq)
+                in_uris = [self.cold.uri(o["object_key"]) for o in objs]
+                rows = await self.engine.compact(in_uris, self.cold.uri(out_key))
+                await self.cold.record(_meta(m, KIND_COLD, out_key, objs, rows))
+                # Drop the now-merged staging objects.
+                for o in objs:
+                    await asyncio.to_thread(self.cold.delete, o["object_key"])
+                    await self.cold.forget(o["object_key"])
+                log.info(
+                    "compacted %s dt=%s: %d objs -> %s (%d rows)", m, day, len(objs), out_key, rows
                 )
-                """
-            )
+                results.append(CompactResult(m, day, out_key, len(objs), rows))
+        return results
+
+    # ---- eviction --------------------------------------------------------
+
+    async def evict_once(
+        self, older_than: str | None = None, measurement: str | None = None
+    ) -> list[EvictResult]:
+        await self.ensure_manifest()
+        window = older_than or settings.tier_hot_window
+        tables = [measurement] if measurement else await self._hypertables()
+        results: list[EvictResult] = []
+        for table in tables:
+            chunks = await self._eligible_chunks(table, window)
+            if not chunks:
+                continue
+            objs = await self.cold.objects(table)
+            intervals = [(o["range_start"], o["range_end"]) for o in objs]
+            for cs, ce in chunks:
+                if is_covered(cs, ce, intervals):
+                    await self._drop_chunk(table, cs, ce)
+                    log.info("evicted %s chunk [%s, %s) (covered by cold)", table, cs, ce)
+                    results.append(EvictResult(table, cs, ce))
+                else:
+                    # Not in cold (e.g. write-through was off). Export then drop.
+                    out_key = cold_key(table, day_of(cs), 0)
+                    rows = await self.engine.export_hot_range(
+                        _hot_ref(table), self.cold.uri(out_key), cs, ce
+                    )
+                    from .coldstore import ObjectMeta
+
+                    await self.cold.record(
+                        ObjectMeta(table, KIND_COLD, out_key, cs, ce, rows, 0, 0)
+                    )
+                    await self._drop_chunk(table, cs, ce)
+                    log.info("exported+evicted %s chunk [%s, %s) (%d rows)", table, cs, ce, rows)
+                    results.append(EvictResult(table, cs, ce))
+        return results
+
+    async def run_once(self, older_than: str | None = None, measurement: str | None = None) -> dict:
+        compacted = await self.compact_once(measurement)
+        evicted = await self.evict_once(older_than, measurement)
+        return {"compacted": compacted, "evicted": evicted}
 
     # ---- discovery -------------------------------------------------------
 
@@ -77,10 +177,8 @@ class Tierer:
         async with self.store.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT hypertable_name
-                FROM timescaledb_information.hypertables
-                WHERE hypertable_schema = $1
-                ORDER BY hypertable_name
+                SELECT hypertable_name FROM timescaledb_information.hypertables
+                WHERE hypertable_schema = $1 ORDER BY hypertable_name
                 """,
                 settings.tsdb_schema,
             )
@@ -92,8 +190,7 @@ class Tierer:
         async with self.store.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT range_start, range_end
-                FROM timescaledb_information.chunks
+                SELECT range_start, range_end FROM timescaledb_information.chunks
                 WHERE hypertable_schema = $1 AND hypertable_name = $2
                   AND range_end <= now() - INTERVAL '{older_than}'
                 ORDER BY range_start
@@ -102,56 +199,6 @@ class Tierer:
                 table,
             )
         return [(r["range_start"], r["range_end"]) for r in rows]
-
-    # ---- one pass --------------------------------------------------------
-
-    async def run_once(
-        self, older_than: str | None = None, measurement: str | None = None
-    ) -> list[TierResult]:
-        await self.ensure_manifest()
-        window = older_than or settings.tier_hot_window
-        tables = [measurement] if measurement else await self._hypertables()
-
-        results: list[TierResult] = []
-        for table in tables:
-            chunks = await self._eligible_chunks(table, window)
-            for range_start, range_end in chunks:
-                key = cold_key(table, range_start)
-                rows = await self.engine.export_range(_hot_ref(table), key, range_start, range_end)
-                await self._record(table, key, range_start, range_end, rows)
-                await self._drop_chunk(table, range_start, range_end)
-                log.info(
-                    "tiered %s [%s, %s) -> %s (%d rows)",
-                    table,
-                    range_start.isoformat(),
-                    range_end.isoformat(),
-                    key,
-                    rows,
-                )
-                results.append(TierResult(table, key, range_start, range_end, rows))
-        return results
-
-    async def _record(
-        self, table: str, key: str, start: datetime, end: datetime, rows: int
-    ) -> None:
-        async with self.store.pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO {_manifest_qualified()}
-                    (hypertable, object_key, range_start, range_end, rows)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (hypertable, range_start) DO UPDATE SET
-                    object_key = EXCLUDED.object_key,
-                    range_end  = EXCLUDED.range_end,
-                    rows       = EXCLUDED.rows,
-                    created_at = now()
-                """,
-                table,
-                key,
-                start,
-                end,
-                rows,
-            )
 
     async def _drop_chunk(self, table: str, start: datetime, end: datetime) -> None:
         async with self.store.pool.acquire() as conn:
@@ -162,52 +209,49 @@ class Tierer:
                 start,
             )
 
-    # ---- manifest reads --------------------------------------------------
+    # ---- federation ------------------------------------------------------
 
-    async def cold_keys(self, table: str) -> list[str]:
-        async with self.store.pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"SELECT object_key FROM {_manifest_qualified()} "
-                f"WHERE hypertable = $1 ORDER BY range_start",
-                table,
-            )
-        return [r["object_key"] for r in rows]
+    async def view_specs(
+        self,
+        include_hot: bool,
+        include_cold: bool,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[str, list[str]]:
+        """Build {table: [relation refs]} for federated views, range-pruning
+        cold objects by [start, end] when provided."""
+        tables: set[str] = set()
+        if include_hot:
+            tables.update(await self._hypertables())
+        if include_cold:
+            tables.update(await self.cold.measurements())
+
+        specs: dict[str, list[str]] = {}
+        for table in sorted(tables):
+            refs: list[str] = []
+            if include_hot:
+                refs.append(_hot_ref(table))
+            if include_cold:
+                objs = select_overlapping(await self.cold.objects(table), start, end)
+                if objs:
+                    uris = [self.cold.uri(o["object_key"]) for o in objs]
+                    refs.append(read_parquet_ref(uris))
+            specs[table] = refs
+        return specs
 
     async def status(self) -> list[dict]:
         await self.ensure_manifest()
         async with self.store.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT hypertable,
-                       count(*)        AS objects,
-                       sum(rows)       AS rows,
-                       min(range_start) AS oldest,
-                       max(range_end)   AS newest
-                FROM {_manifest_qualified()}
-                GROUP BY hypertable
-                ORDER BY hypertable
+                SELECT measurement, kind,
+                       count(*) AS objects, sum(rows) AS rows,
+                       min(range_start) AS oldest, max(range_end) AS newest
+                FROM {_quote_ident(settings.tsdb_schema)}._cold_objects
+                GROUP BY measurement, kind ORDER BY measurement, kind
                 """
             )
         return [dict(r) for r in rows]
-
-    async def view_specs(
-        self, include_hot: bool, include_cold: bool
-    ) -> dict[str, tuple[str | None, list[str]]]:
-        """Build the {table: (hot_ref, cold_keys)} map for federated views."""
-        tables: set[str] = set()
-        if include_hot:
-            tables.update(await self._hypertables())
-        if include_cold:
-            async with self.store.pool.acquire() as conn:
-                rows = await conn.fetch(f"SELECT DISTINCT hypertable FROM {_manifest_qualified()}")
-            tables.update(r["hypertable"] for r in rows)
-
-        specs: dict[str, tuple[str | None, list[str]]] = {}
-        for table in sorted(tables):
-            hot_ref = _hot_ref(table) if include_hot else None
-            cold = await self.cold_keys(table) if include_cold else []
-            specs[table] = (hot_ref, cold)
-        return specs
 
     # ---- background loop -------------------------------------------------
 
@@ -234,3 +278,18 @@ class Tierer:
                 await asyncio.wait_for(
                     self._stopping.wait(), timeout=settings.tier_interval_seconds
                 )
+
+
+def _meta(measurement: str, kind: str, key: str, objs: list[dict], rows: int):
+    from .coldstore import ObjectMeta
+
+    return ObjectMeta(
+        measurement=measurement,
+        kind=kind,
+        object_key=key,
+        range_start=min(o["range_start"] for o in objs),
+        range_end=max(o["range_end"] for o in objs),
+        rows=rows,
+        min_seq=min(o["min_seq"] for o in objs),
+        max_seq=max(o["max_seq"] for o in objs),
+    )

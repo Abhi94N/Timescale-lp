@@ -368,117 +368,164 @@ service later still without re-creating tables.
 
 ---
 
-## Tiered storage — TimescaleDB (hot) + Parquet on S3/MinIO (cold)
+## Tiered storage — TimescaleDB as a write-through cache over a Parquet lakehouse
 
-TimescaleDB is treated as a **hot cache** for recent data. Older data is
-moved out into **Parquet objects** on S3-compatible storage (MinIO in the
-compose stack), which is far cheaper per byte and independently scalable.
-Queries can transparently span both tiers.
+TimescaleDB is a **write-through cache**: every write lands in TimescaleDB
+*and* is durably persisted to **Parquet on S3-compatible storage** (MinIO in
+the compose stack) before it is acknowledged. Cold storage is the **source of
+truth**, so TimescaleDB holds only recent data and can be evicted at any time
+with zero data-loss risk. Queries transparently span both tiers.
 
 ```
-        writes (line protocol)
-                │
-                ▼
-       ┌─────────────────┐    age out chunks    ┌──────────────────────┐
-       │  TimescaleDB    │  ───────────────────▶ │  Parquet on S3/MinIO │
-       │  (hot, recent)  │     (tierer)          │  (cold, historical)  │
-       └────────┬────────┘                       └───────────┬──────────┘
-                │                                            │
-                │            DuckDB federation               │
-                └──────────────────┬─────────────────────────┘
-                                   ▼
-                     /api/v1/query?tier=all   (hot ∪ cold)
+   write (line protocol)
+          │
+          ▼  (1) staging Parquet         (2) COPY upsert
+   ┌──────────────┐  ───────────────▶ S3 ◀───────────────  ┌──────────────┐
+   │   batcher    │   durable cold                          │ TimescaleDB  │
+   └──────────────┘   (source of truth)                     │ (hot cache)  │
+          │  ack only after BOTH (1) and (2) succeed        └──────┬───────┘
+          ▼                                                        │
+   compaction: staging ─▶ big day-partitioned cold objects        │
+   eviction:   drop hot chunks already covered by cold            │
+                                                                   │
+              DuckDB federation (dedup by seq, range-pruned)       │
+   /api/v1/query?tier=all  ◀────────── S3 cold ─────────  hot ◀────┘
 ```
 
-### How it works
+### Write-through path
 
-- **Write path is unchanged** — points always land in TimescaleDB first.
-- A **tierer** finds hypertable chunks whose time range is entirely older
-  than `TIER_HOT_WINDOW`, and for each one (oldest first):
-  1. `COPY (SELECT * FROM pg.lp.<table> WHERE time in [chunk]) TO
-     's3://…/<table>/<start>.parquet'` via **DuckDB** (streams Postgres →
-     Parquet without round-tripping through Python),
-  2. records the object in the `lp._cold_chunks` manifest,
-  3. drops the chunk from TimescaleDB.
-- **Queries** run through **DuckDB**, which `ATTACH`es TimescaleDB and reads
-  Parquet from S3. Each measurement is exposed as a view that
-  `UNION ALL BY NAME`s the hot table with its cold Parquet objects.
+For each flushed batch the service:
 
-This is fully self-hosted and portable — point `S3_ENDPOINT` at AWS S3,
-Cloudflare R2, Backblaze B2, or any S3-compatible store and nothing else
-changes.
+1. Builds a typed Arrow table and writes one **staging Parquet object**
+   (`<m>/staging/<minSeq>-<maxSeq>.parquet`) to S3 — durable in cold.
+2. `COPY`-upserts the same rows into the TimescaleDB hypertable.
+3. **Acks only after both succeed.** If step 2 fails, the staging object is a
+   harmless lower-`seq` copy that a retry supersedes — no data is lost.
 
-### Query tiers
+Every row carries a monotonic **`seq`**. The hot table keeps the latest `seq`
+per `(time, tag_hash)` (upsert); cold is append-only and keeps every version.
 
-`/api/v1/query` takes a `tier` parameter:
+### Compaction + eviction (`POST /api/v1/tier/run`, or the background loop)
 
-| `tier`        | Source                         | Engine     | Notes                                     |
-| ------------- | ------------------------------ | ---------- | ----------------------------------------- |
-| `hot` (default) | TimescaleDB only             | Postgres   | Full Timescale SQL (`time_bucket`, etc.); supports `params` |
-| `cold`        | Parquet only                   | DuckDB     | Historical data only                      |
-| `all`         | TimescaleDB ∪ Parquet          | DuckDB     | Transparent across both tiers             |
+- **Compaction** merges many small staging objects into large, day-partitioned,
+  deduped cold objects (`<m>/cold/dt=YYYY-MM-DD/…parquet`) — this is what keeps
+  the cold tier efficient at TB scale.
+- **Eviction** drops TimescaleDB chunks older than `TIER_HOT_WINDOW` once cold
+  fully covers them (it always does under write-through), reclaiming cache
+  space with **no data movement**.
 
-> DuckDB also has `time_bucket(interval, ts)`, so the common downsampling
-> queries work under `tier=all`/`cold` too. Timescale-only hyperfunctions do
-> not — use `tier=hot` for those.
+### Reads — dedup + partition pruning
+
+Federated reads (`tier=all`/`cold`) go through DuckDB, which exposes each
+measurement as a view that unions hot + cold and **dedups by `(time, tag_hash)`
+keeping the highest `seq`** — so an update applied while hot is reflected even
+after the older version was archived to cold.
+
+| `tier`          | Source                | Engine   | Notes                                                  |
+| --------------- | --------------------- | -------- | ------------------------------------------------------ |
+| `hot` (default) | TimescaleDB only      | Postgres | Full Timescale SQL (`time_bucket`, hyperfunctions); supports `params` |
+| `cold`          | Parquet only          | DuckDB   | Historical, deduped                                    |
+| `all`           | TimescaleDB ∪ Parquet | DuckDB   | Transparent, deduped across tiers                      |
+
+Pass `start`/`end` to prune which cold objects are scanned — the key
+TB-scale read lever, since it skips Parquet objects whose time range doesn't
+overlap the query:
+
+```bash
+curl -G 'http://localhost:8080/api/v1/query' \
+  --data-urlencode 'tier=all' \
+  --data-urlencode 'start=2026-06-01T00:00:00Z' \
+  --data-urlencode 'end=2026-06-02T00:00:00Z' \
+  --data-urlencode 'sql=SELECT count(*) FROM lp.cpu'
+```
 
 ### Try it
 
-The hot window defaults to 7 days, so to see tiering immediately, trigger a
-pass with a tiny window. (Send some data with old timestamps first.)
-
 ```bash
-# write a point dated well in the past
+# write a point dated in the past (write-through persists it to cold immediately)
 curl -X POST 'http://localhost:8080/api/v1/write?sync=true' \
   --data-binary 'cpu,host=a value=0.5 1577836800000000000'   # 2020-01-01
 
-# force a tiering pass for anything older than 1 hour
+# update it (same series+timestamp, new value)
+curl -X POST 'http://localhost:8080/api/v1/write?sync=true' \
+  --data-binary 'cpu,host=a value=0.9 1577836800000000000'
+
+# compact staging + evict chunks older than 1 hour (data already in cold)
 curl -X POST http://localhost:8080/api/v1/tier/run \
-  -H 'content-type: application/json' \
-  -d '{"older_than": "1 hour"}'
-# {"moved": 1, "chunks": [{"measurement":"cpu","object_key":"cpu/20200101T000000Z.parquet",...}]}
+  -H 'content-type: application/json' -d '{"older_than":"1 hour"}'
 
-# the row is gone from the hot tier ...
+# gone from the hot cache ...
 curl -s -X POST 'http://localhost:8080/api/v1/query?tier=hot' \
-  -H 'content-type: application/json' -d '{"sql":"SELECT count(*) n FROM lp.cpu"}'
-# [{"n": 0}]
+  -H 'content-type: application/json' -d '{"sql":"SELECT count(*) n FROM lp.cpu"}'   # [{"n":0}]
 
-# ... but still queryable across both tiers
+# ... still served from cold, and the update (0.9) wins via seq dedup
 curl -s -X POST 'http://localhost:8080/api/v1/query?tier=all' \
-  -H 'content-type: application/json' -d '{"sql":"SELECT count(*) n FROM lp.cpu"}'
-# [{"n": 1}]
+  -H 'content-type: application/json' -d '{"sql":"SELECT f_value FROM lp.cpu WHERE t_host='"'"'a'"'"'"}'
+# [{"f_value": 0.9}]
 
-# tiering manifest summary
-curl -s http://localhost:8080/api/v1/tier/status
+curl -s http://localhost:8080/api/v1/tier/status   # manifest summary (staging + cold)
 ```
 
-Browse the cold objects in the MinIO console at <http://localhost:9001>
+Browse cold objects in the MinIO console at <http://localhost:9001>
 (`minioadmin` / `minioadmin`).
+
+### Scaling to terabytes
+
+The path is built to stay memory-bounded and query-efficient as cold grows:
+
+- **Streaming everywhere** — staging is written per batch; compaction and
+  eviction are `COPY`/`drop_chunks` operations that never materialize a chunk
+  in Python.
+- **Right-sized cold files** — compaction targets large day-partitioned
+  Parquet (`COLD_COMPACT_TARGET_BYTES`, default 256 MB) so a TB is thousands of
+  files, not millions.
+- **Pruned reads** — `start`/`end` skip non-overlapping objects, and DuckDB
+  applies Parquet row-group statistics pushdown within the rest.
+- **Cheap eviction** — write-through means eviction is a metadata drop, not a
+  data copy.
+
+Validate with the bundled load generator (stdlib-only, ships in the image):
+
+```bash
+# a few million rows (CI scale), then verify the hot count
+docker compose exec ingest python scripts/loadgen.py \
+  --rows 2_000_000 --series 2000 --concurrency 32 --verify
+
+# crank up for a real soak (distribute across hosts/processes for a true TB)
+docker compose exec ingest python scripts/loadgen.py --duration 600 --concurrency 64
+```
+
+Rough sizing: a row is ~30–60 B in compacted Parquet, so **1 TB cold ≈ 20–30
+billion rows**. Reach that by running the generator distributed; a single
+process measures per-core throughput and correctness, not raw TB movement.
 
 ### Configuration
 
-| Variable                | Default              | Effect                                              |
-| ----------------------- | -------------------- | --------------------------------------------------- |
-| `QUERY_ENGINE_ENABLED`  | `true`               | Enables the DuckDB federated query + tiering engine |
-| `TIER_ENABLED`          | `false`              | Runs the background tierer loop                      |
-| `TIER_HOT_WINDOW`       | `7 days`             | Data younger than this stays in TimescaleDB         |
-| `TIER_INTERVAL_SECONDS` | `3600`               | Background tierer cadence                            |
-| `S3_ENDPOINT`           | `http://minio:9000`  | S3 endpoint (swap for R2/S3/B2 in prod)             |
-| `S3_BUCKET`             | `timescale-cold`     | Cold object bucket                                   |
-| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `minioadmin` | S3 credentials                                      |
+| Variable                   | Default              | Effect                                              |
+| -------------------------- | -------------------- | --------------------------------------------------- |
+| `WRITE_THROUGH`            | `true`               | Persist every batch to cold before acking           |
+| `QUERY_ENGINE_ENABLED`     | `true`               | Enables the DuckDB federated query + tiering engine |
+| `TIER_ENABLED`             | `false`              | Runs the background compaction+eviction loop         |
+| `TIER_HOT_WINDOW`          | `7 days`             | Data younger than this stays in TimescaleDB         |
+| `TIER_INTERVAL_SECONDS`    | `3600`               | Background maintenance cadence                       |
+| `COLD_COMPACT_TARGET_BYTES`| `268435456` (256 MB) | Target compacted-object size                         |
+| `S3_ENDPOINT`              | `http://minio:9000`  | S3 endpoint (swap for R2/S3/B2 in prod)             |
+| `S3_BUCKET`                | `timescale-cold`     | Cold object bucket                                   |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `minioadmin`  | S3 credentials                                       |
 
 ### Operational notes
 
-- **Crash safety**: exports use deterministic keys and the manifest upserts,
-  so an interrupted pass just re-does the unfinished chunk on the next run.
-- **Recovery / re-hydration**: cold data is plain Parquet. To pull a range
-  back into TimescaleDB, read it with DuckDB (or any Parquet reader) and
-  `COPY` it back into the hypertable.
-- **Compression**: cold Parquet is written with zstd. TimescaleDB native
-  compression still applies to hot chunks before they age out.
-- **Extensions**: the ingest image pre-installs DuckDB's `httpfs` and
-  `postgres` extensions at build time, so the runtime container needs no
-  network to load them.
+- **Crash safety**: staging keys are deterministic and the manifest upserts;
+  an interrupted pass simply redoes the unfinished object.
+- **Source of truth**: cold (S3) is authoritative. To rebuild the cache, read
+  cold Parquet with DuckDB (or any reader) and `COPY` it back into a hypertable.
+- **Compression**: cold Parquet is zstd; TimescaleDB native compression still
+  applies to hot chunks.
+- **Multi-replica**: `seq` is process-monotonic. Running multiple ingest
+  replicas needs a shared sequence source (e.g. a Postgres sequence) so seq
+  ordering is global — documented as a follow-up.
+- **Extensions**: the image pre-installs DuckDB's `httpfs` + `postgres`
+  extensions, so the runtime container needs no network to load them.
 
 ---
 

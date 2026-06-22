@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .batcher import Batcher
+from .coldstore import ColdStore
 from .config import settings
 from .engine import DuckEngine
 from .lineproto import parse_batch
@@ -68,14 +69,17 @@ def create_app() -> FastAPI:
 
         engine: DuckEngine | None = None
         tierer: Tierer | None = None
-        if settings.query_engine_enabled or settings.tier_enabled:
+        if settings.query_engine_enabled or settings.tier_enabled or settings.write_through:
             try:
+                cold = ColdStore.from_settings(store)
+                await cold.ensure_manifest()
+                store.cold = cold  # enables write-through on the hot write path
                 engine = await DuckEngine.connect()
-                tierer = Tierer(store, engine)
-                await tierer.ensure_manifest()
+                tierer = Tierer(store, engine, cold)
                 await tierer.start()
             except Exception:
-                log.exception("query/tiering engine unavailable; running hot-only")
+                log.exception("cold/tiering engine unavailable; running hot-only")
+                store.cold = None
                 engine = None
                 tierer = None
         state["engine"] = engine
@@ -152,7 +156,13 @@ def create_app() -> FastAPI:
             return Response(status_code=204)
         return ORJSONResponse(payload.model_dump(), status_code=status)
 
-    async def _run_query(sql: str, params: list[object], tier: str) -> list[dict]:
+    async def _run_query(
+        sql: str,
+        params: list[object],
+        tier: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[dict]:
         if tier not in TIERS:
             raise HTTPException(400, f"invalid tier; expected one of {sorted(TIERS)}")
         if tier == "hot":
@@ -170,14 +180,25 @@ def create_app() -> FastAPI:
             raise HTTPException(400, "parameterized queries are only supported for tier=hot")
         include_hot = tier == "all"
         include_cold = tier in ("all", "cold")
-        specs = await tierer.view_specs(include_hot=include_hot, include_cold=include_cold)
+        # start/end prune which cold objects are scanned — the key TB-scale lever.
+        specs = await tierer.view_specs(
+            include_hot=include_hot,
+            include_cold=include_cold,
+            start=_normalize_dt(start),
+            end=_normalize_dt(end),
+        )
         await engine.register_views(specs)
         return await engine.query_rows(sql)
 
     @app.post("/api/v1/query")
-    async def query(req: QueryRequest, tier: str = Query("hot")) -> Response:
+    async def query(
+        req: QueryRequest,
+        tier: str = Query("hot"),
+        start: datetime | None = Query(None, description="Prune cold objects to time >= start"),
+        end: datetime | None = Query(None, description="Prune cold objects to time <= end"),
+    ) -> Response:
         try:
-            rows = await _run_query(req.sql, req.params, tier)
+            rows = await _run_query(req.sql, req.params, tier, start, end)
         except HTTPException:
             raise
         except Exception as exc:
@@ -187,9 +208,14 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/v1/query")
-    async def query_get(sql: str = Query(...), tier: str = Query("hot")) -> Response:
+    async def query_get(
+        sql: str = Query(...),
+        tier: str = Query("hot"),
+        start: datetime | None = Query(None),
+        end: datetime | None = Query(None),
+    ) -> Response:
         try:
-            rows = await _run_query(sql, [], tier)
+            rows = await _run_query(sql, [], tier, start, end)
         except HTTPException:
             raise
         except Exception as exc:
@@ -204,20 +230,27 @@ def create_app() -> FastAPI:
         if tierer is None:
             raise HTTPException(503, "tiering is disabled (set QUERY_ENGINE_ENABLED=true)")
         try:
-            results = await tierer.run_once(req.older_than, req.measurement)
+            res = await tierer.run_once(req.older_than, req.measurement)
         except Exception as exc:
             raise HTTPException(400, f"tiering error: {exc}") from exc
         return {
-            "moved": len(results),
-            "chunks": [
+            "compacted": [
                 {
-                    "measurement": r.measurement,
-                    "object_key": r.object_key,
-                    "range_start": r.range_start.isoformat(),
-                    "range_end": r.range_end.isoformat(),
-                    "rows": r.rows,
+                    "measurement": c.measurement,
+                    "day": c.day,
+                    "object_key": c.object_key,
+                    "merged": c.merged,
+                    "rows": c.rows,
                 }
-                for r in results
+                for c in res["compacted"]
+            ],
+            "evicted": [
+                {
+                    "measurement": e.measurement,
+                    "range_start": e.range_start.isoformat(),
+                    "range_end": e.range_end.isoformat(),
+                }
+                for e in res["evicted"]
             ],
         }
 

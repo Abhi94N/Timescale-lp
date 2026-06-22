@@ -64,9 +64,10 @@ jobs:
           docker compose logs --no-color | tail -200
           exit 1
 
-      - name: Smoke write + query
+      - name: Smoke write + query (write-through)
         run: |
           set -e
+          # Old timestamp (2023) so it's eligible for eviction below.
           curl -fsS -X POST 'http://localhost:8080/api/v1/write?sync=true' \
             --data-binary $'cpu,host=a,region=us value=0.5,count=1i 1700000000000000000\ncpu,host=b value=0.7'
           sleep 1
@@ -74,19 +75,45 @@ jobs:
             -H 'content-type: application/json' \
             -d '{"sql":"SELECT count(*) AS n FROM lp.cpu"}'
 
-      - name: Smoke tiering (hot -> cold -> federated)
+      - name: Update via line protocol (dedup-on-read check)
+        run: |
+          set -e
+          # Re-send host=a's 2023 point with a new value; later read must reflect it.
+          curl -fsS -X POST 'http://localhost:8080/api/v1/write?sync=true' \
+            --data-binary 'cpu,host=a,region=us value=0.9,count=42i 1700000000000000000'
+
+      - name: Compact + evict (write-through cache eviction)
         run: |
           set -euo pipefail
-          # The 2020 row above is well older than any window; tier it out.
+          # Compacts staging objects and evicts chunks older than 1 hour. The
+          # 2023 rows already live in cold (write-through), so eviction is a
+          # pure cache drop.
           curl -fsS -X POST http://localhost:8080/api/v1/tier/run \
             -H 'content-type: application/json' -d '{"older_than":"1 hour"}'
-          # Federated count must still see the tiered row.
+          curl -fsS http://localhost:8080/api/v1/tier/status
+
+      - name: Federated read across hot + cold (with dedup + pruning)
+        run: |
+          set -euo pipefail
+          # Federated count must still see the data after eviction, and the
+          # updated value (0.9) must win over the original (0.5).
           ALL=$(curl -fsS -X POST 'http://localhost:8080/api/v1/query?tier=all' \
             -H 'content-type: application/json' \
             -d '{"sql":"SELECT count(*) AS n FROM lp.cpu"}')
-          echo "federated: $ALL"
+          echo "federated count: $ALL"
           echo "$ALL" | grep -q '"n": *[1-9]'
-          curl -fsS http://localhost:8080/api/v1/tier/status
+          VAL=$(curl -fsS -X POST 'http://localhost:8080/api/v1/query?tier=all' \
+            -H 'content-type: application/json' \
+            -d '{"sql":"SELECT f_value FROM lp.cpu WHERE t_host='"'"'a'"'"'"}')
+          echo "host=a value: $VAL"
+          echo "$VAL" | grep -q '0.9'
+
+      - name: Load test (a few million rows) + verify
+        run: |
+          set -e
+          docker compose exec -T ingest python scripts/loadgen.py \
+            --rows 2000000 --series 2000 --batch 10000 --concurrency 32 \
+            --measurement load --verify
 
       - name: Dump logs on failure
         if: failure()

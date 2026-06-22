@@ -1,31 +1,12 @@
-from datetime import UTC, datetime
-
 from app import engine
 from app.config import settings
-
-
-def test_cold_key_is_utc_deterministic():
-    ts = datetime(2026, 6, 1, 5, 30, 0, tzinfo=UTC)
-    assert engine.cold_key("cpu", ts) == "cpu/20260601T053000Z.parquet"
-
-
-def test_cold_key_normalizes_offset_to_utc():
-    from datetime import timedelta, timezone
-
-    ts = datetime(2026, 6, 1, 7, 30, 0, tzinfo=timezone(timedelta(hours=2)))
-    # 07:30+02:00 == 05:30Z
-    assert engine.cold_key("cpu", ts) == "cpu/20260601T053000Z.parquet"
-
-
-def test_s3_uri_uses_bucket():
-    assert engine.s3_uri("cpu/x.parquet") == f"s3://{settings.s3_bucket}/cpu/x.parquet"
 
 
 def test_s3_secret_sql_contains_endpoint_and_keys():
     sql = engine.s3_secret_sql()
     assert "TYPE S3" in sql
     assert settings.s3_endpoint_host in sql
-    assert "USE_SSL false" in sql  # default http endpoint
+    assert "USE_SSL false" in sql
     assert "URL_STYLE 'path'" in sql
 
 
@@ -37,54 +18,55 @@ def test_attach_pg_sql_read_only():
     assert settings.tsdb_database in sql
 
 
-def test_copy_to_parquet_sql():
-    sql = engine.copy_to_parquet_sql("SELECT 1", "cpu/x.parquet")
-    assert sql.startswith("COPY (SELECT 1) TO 's3://")
-    assert "FORMAT parquet" in sql
-    assert "OVERWRITE_OR_IGNORE true" in sql
+def test_read_parquet_ref_union_by_name():
+    ref = engine.read_parquet_ref(["s3://b/a.parquet", "s3://b/c.parquet"])
+    assert ref.startswith("read_parquet([")
+    assert "union_by_name=true" in ref
+    assert "'s3://b/a.parquet'" in ref
 
 
-def test_build_view_sql_hot_only():
-    sql = engine.build_view_sql("lp", "cpu", "pg.lp.cpu", [])
-    assert sql == 'CREATE OR REPLACE VIEW "lp"."cpu" AS SELECT * FROM pg.lp.cpu'
-
-
-def test_build_view_sql_cold_only():
-    sql = engine.build_view_sql("lp", "cpu", None, ["cpu/a.parquet", "cpu/b.parquet"])
-    assert "read_parquet([" in sql
-    assert "union_by_name=true" in sql
-    assert "pg.lp.cpu" not in sql
-
-
-def test_build_view_sql_hot_and_cold_uses_union_by_name():
-    sql = engine.build_view_sql("lp", "cpu", "pg.lp.cpu", ["cpu/a.parquet"])
-    assert "SELECT * FROM pg.lp.cpu" in sql
+def test_build_federated_view_sql_dedups_by_seq():
+    sql = engine.build_federated_view_sql("lp", "cpu", ["pg.lp.cpu", "read_parquet(['x'])"])
+    assert 'CREATE OR REPLACE VIEW "lp"."cpu"' in sql
     assert "UNION ALL BY NAME" in sql
-    assert "read_parquet([" in sql
+    assert "row_number() OVER (PARTITION BY time, tag_hash ORDER BY seq DESC)" in sql
+    assert "EXCLUDE (seq, _rn)" in sql
+    assert "_rn = 1" in sql
 
 
-def test_build_view_sql_empty_is_degenerate():
-    sql = engine.build_view_sql("lp", "cpu", None, [])
+def test_build_federated_view_sql_empty():
+    sql = engine.build_federated_view_sql("lp", "cpu", [])
     assert "WHERE false" in sql
 
 
-def test_duckdb_union_by_name_fills_missing_columns():
-    """The federation view relies on UNION ALL BY NAME aligning differing
-    column sets and filling gaps with NULL. Validate that semantic against a
-    real DuckDB so a version change can't silently break federation."""
+def test_compact_sql_dedups_and_keeps_seq():
+    sql = engine.compact_sql(["s3://b/a.parquet"], "s3://b/cold/x.parquet")
+    assert sql.startswith("COPY (")
+    assert "row_number() OVER" in sql
+    assert "FORMAT parquet" in sql
+    # seq is NOT excluded in compaction output (needed for cross-tier dedup)
+    assert "EXCLUDE (seq" not in sql
+
+
+def test_duckdb_dedup_view_keeps_newest_seq(tmp_path):
+    """End-to-end check of the federation dedup semantic against a real DuckDB:
+    a newer (higher-seq) version in 'hot' must win over an older 'cold' row for
+    the same (time, tag_hash)."""
     import duckdb
 
     con = duckdb.connect(":memory:")
-    con.execute("CREATE TABLE hot (time INTEGER, f_value DOUBLE, f_new INTEGER)")
-    con.execute("INSERT INTO hot VALUES (3, 3.5, 9)")
-    con.execute("CREATE TABLE cold (time INTEGER, f_value DOUBLE)")  # no f_new
-    con.execute("INSERT INTO cold VALUES (1, 1.5)")
+    # Stand-ins for hot (PG) and cold (Parquet) — both carry time, tag_hash, seq.
+    con.execute("CREATE TABLE hot (time INTEGER, tag_hash BIGINT, seq BIGINT, f_value DOUBLE)")
+    con.execute("INSERT INTO hot VALUES (1, 100, 50, 9.9)")  # updated value, high seq
+    con.execute("CREATE TABLE cold (time INTEGER, tag_hash BIGINT, seq BIGINT, f_value DOUBLE)")
+    con.execute("INSERT INTO cold VALUES (1, 100, 10, 1.1)")  # original, low seq
+    con.execute("INSERT INTO cold VALUES (2, 100, 20, 2.2)")  # only in cold
 
-    rows = con.execute(
-        "SELECT time, f_value, f_new FROM ("
-        "  SELECT * FROM hot UNION ALL BY NAME SELECT * FROM cold"
-        ") ORDER BY time"
-    ).fetchall()
-    assert rows[0] == (1, 1.5, None)  # cold row: f_new filled with NULL
-    assert rows[1] == (3, 3.5, 9)
+    view_sql = engine.build_federated_view_sql("main", "cpu", ["hot", "cold"])
+    con.execute(view_sql)
+    rows = con.execute('SELECT time, f_value FROM "main"."cpu" ORDER BY time').fetchall()
+    assert rows == [(1, 9.9), (2, 2.2)]  # dedup kept hot's newer value for time=1
+    # seq is not exposed by the view
+    cols = [d[0] for d in con.execute('SELECT * FROM "main"."cpu"').description]
+    assert "seq" not in cols
     con.close()

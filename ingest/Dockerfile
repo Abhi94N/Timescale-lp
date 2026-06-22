@@ -72,6 +72,8 @@ COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --from=builder --chown=app:app /app/app /app/app
 # Carry the pre-installed DuckDB extensions (downloaded as root in the builder).
 COPY --from=builder --chown=app:app /root/.duckdb /app/.duckdb
+# Ops tooling (stdlib-only load generator).
+COPY --chown=app:app scripts /app/scripts
 
 USER app
 

@@ -25,18 +25,36 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import re
+import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import asyncpg
 
 from .config import settings
 from .lineproto import Point
 
+if TYPE_CHECKING:
+    from .coldstore import ColdStore
+
 log = logging.getLogger(__name__)
 
 _IDENT_OK = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Monotonic ingest sequence. Seeded from wall-clock nanoseconds so that a
+# process restart never reissues a sequence below one already persisted (a
+# lower seq on a newer write would let stale cold data shadow it on read).
+# Reserved per-point; the surviving row for a (time, tag_hash) key carries the
+# highest seq, which dedup-on-read uses to pick the latest version.
+_SEQ_BASE = time.time_ns()
+_seq_counter = itertools.count()
+
+
+def _next_seq() -> int:
+    return _SEQ_BASE + next(_seq_counter)
 
 
 def _safe_ident(name: str) -> str:
@@ -132,6 +150,8 @@ class Store:
         self.pool = pool
         self._schema_cache: dict[str, TableSchema] = {}
         self._schema_locks: dict[str, asyncio.Lock] = {}
+        # Optional write-through cold store (set by the app after construction).
+        self.cold: ColdStore | None = None
 
     @classmethod
     async def connect(cls) -> Store:
@@ -239,9 +259,14 @@ class Store:
                     f"""
                     CREATE TABLE IF NOT EXISTS {qualified} (
                         time TIMESTAMPTZ NOT NULL,
-                        tag_hash BIGINT NOT NULL
+                        tag_hash BIGINT NOT NULL,
+                        seq BIGINT NOT NULL DEFAULT 0
                     )
                     """
+                )
+                # Defensive for tables created before `seq` existed.
+                await conn.execute(
+                    f"ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 0"
                 )
                 await conn.execute(
                     f"""
@@ -346,22 +371,32 @@ class Store:
 
         schema = await self._ensure_schema(measurement, tag_names, field_samples)
 
-        cols: list[str] = ["time", "tag_hash"]
+        cols: list[str] = ["time", "tag_hash", "seq"]
         for t in tag_names:
             cols.append(schema.tag_cols[t])
         for f in field_samples:
             cols.append(schema.field_cols[f][0])
 
-        records: list[tuple] = []
+        # Build rows, assigning a monotonic seq per point, and dedup within the
+        # batch by (time, tag_hash) keeping the last (highest-seq) occurrence.
+        # The dedup also avoids "ON CONFLICT cannot affect row a second time".
+        deduped: dict[tuple, tuple] = {}
         for p in points:
-            row: list[object] = [p.time, _hash_tags(p.tags)]
+            key = (p.time, _hash_tags(p.tags))
+            row: list[object] = [p.time, key[1], _next_seq()]
             for t in tag_names:
                 row.append(p.tags.get(t))
             for f in field_samples:
-                v = p.fields.get(f)
                 col_type = schema.field_cols[f][1]
-                row.append(_coerce(v, col_type))
-            records.append(tuple(row))
+                row.append(_coerce(p.fields.get(f), col_type))
+            deduped[key] = tuple(row)
+        records: list[tuple] = list(deduped.values())
+
+        # Write-through: persist this batch to cold storage BEFORE Postgres, so
+        # cold (the source of truth) always has every acknowledged write. An
+        # interrupted PG write just leaves a harmless lower-seq cold object.
+        if self.cold is not None and settings.write_through:
+            await self._write_through(measurement, schema, cols, records)
 
         async with self.pool.acquire() as conn, conn.transaction():
             tmp = f"_lp_stage_{schema.table}"
@@ -387,7 +422,38 @@ class Store:
                 ON CONFLICT (time, tag_hash) DO UPDATE SET {set_clause}
                 """
             )
-        return len(points)
+        return len(records)
+
+    async def _write_through(
+        self,
+        measurement: str,
+        schema: TableSchema,
+        cols: list[str],
+        records: list[tuple],
+    ) -> None:
+        """Write this batch to a cold-staging Parquet object and record it."""
+        from .coldstore import ObjectMeta, staging_key
+
+        assert self.cold is not None
+        table = build_arrow_table(cols, records, schema)
+        # time is column 0, seq is column 2 (see cols order in _write_measurement).
+        times = [r[0] for r in records]
+        seqs = [r[2] for r in records]
+        min_seq, max_seq = min(seqs), max(seqs)
+        key = staging_key(schema.table, min_seq, max_seq)
+        await asyncio.to_thread(self.cold.write_table, key, table)
+        await self.cold.record(
+            ObjectMeta(
+                measurement=schema.table,
+                kind="staging",
+                object_key=key,
+                range_start=min(times),
+                range_end=max(times),
+                rows=len(records),
+                min_seq=min_seq,
+                max_seq=max_seq,
+            )
+        )
 
     async def query_json(self, sql: str, params: list[object] | None = None) -> list[dict]:
         params = params or []
@@ -435,10 +501,39 @@ class Store:
             return 0
 
 
+def _pa_type(col: str, schema: TableSchema):
+    import pyarrow as pa
+
+    if col == "time":
+        return pa.timestamp("us", tz="UTC")
+    if col in ("tag_hash", "seq"):
+        return pa.int64()
+    if col.startswith("t_"):
+        return pa.string()
+    pg = _col_type_for(col, schema)
+    return {
+        "BIGINT": pa.int64(),
+        "DOUBLE PRECISION": pa.float64(),
+        "BOOLEAN": pa.bool_(),
+    }.get(pg, pa.string())
+
+
+def build_arrow_table(cols: list[str], records: list[tuple], schema: TableSchema):
+    """Build a pyarrow Table (typed per the hot-table column types) from the
+    same row tuples used for the Postgres COPY. Used for write-through staging."""
+    import pyarrow as pa
+
+    arrays = []
+    for i, col in enumerate(cols):
+        values = [r[i] for r in records]
+        arrays.append(pa.array(values, type=_pa_type(col, schema)))
+    return pa.Table.from_arrays(arrays, names=cols)
+
+
 def _col_type_for(col: str, schema: TableSchema) -> str:
     if col == "time":
         return "TIMESTAMPTZ"
-    if col == "tag_hash":
+    if col in ("tag_hash", "seq"):
         return "BIGINT"
     if col.startswith("t_"):
         return "TEXT"

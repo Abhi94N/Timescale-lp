@@ -38,10 +38,12 @@ Re-sending the same `(measurement, tag-set, timestamp)` performs an **UPSERT**
 (via `ON CONFLICT (time, tag_hash) DO UPDATE`), which is how line protocol
 expresses updates in this service — matching InfluxDB semantics.
 
-**Tiered storage:** TimescaleDB is the hot cache; data older than
-`TIER_HOT_WINDOW` is aged out to **Parquet on S3/MinIO** and queried
-transparently via DuckDB with `?tier=all`. See
-[the tiered-storage section](docs/timescaledb.md#tiered-storage--timescaledb-hot--parquet-on-s3minio-cold).
+**Write-through cache + cold lakehouse:** every write lands in TimescaleDB
+*and* is durably persisted to **Parquet on S3/MinIO** before it's acked, so
+cold storage is the source of truth and TimescaleDB is a fully-evictable hot
+cache. Federated reads (`?tier=all`) span both tiers via DuckDB, deduped by
+ingest `seq` and range-pruned with `start`/`end` for TB scale. See
+[the tiered-storage section](docs/timescaledb.md#tiered-storage--timescaledb-as-a-write-through-cache-over-a-parquet-lakehouse).
 
 ---
 
@@ -63,10 +65,12 @@ transparently via DuckDB with `?tier=all`. See
 │   │   ├── batcher.py          # Per-worker batching writer
 │   │   ├── config.py           # pydantic-settings
 │   │   ├── lineproto.py        # Line protocol parser
-│   │   ├── store.py            # Schema mgmt + binary COPY upserts
-│   │   ├── engine.py           # DuckDB: PG↔Parquet export + federated query
-│   │   ├── tiering.py          # Hot→cold tierer + manifest
+│   │   ├── store.py            # Schema mgmt + COPY upserts + write-through + seq
+│   │   ├── coldstore.py        # Parquet on S3/MinIO (pyarrow) + manifest
+│   │   ├── engine.py           # DuckDB: dedup federation + compaction
+│   │   ├── tiering.py          # Compaction + eviction + federation refs
 │   │   └── main.py             # uvicorn entrypoint
+│   ├── scripts/loadgen.py      # Parametrized load generator (TB-scale)
 │   ├── tests/
 │   ├── pyproject.toml          # uv + ruff config
 │   └── Dockerfile              # uv-based slim image

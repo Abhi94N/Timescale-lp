@@ -1,29 +1,24 @@
 """
-DuckDB-backed query/export engine.
+DuckDB-backed query/compaction engine.
 
-DuckDB is used for two things, both reading from the same attached sources:
+DuckDB is the read/compute layer over the two tiers:
 
-1. **Tiering export** — `COPY (SELECT ... FROM pg.lp.<table> WHERE <range>)
-   TO 's3://.../<key>.parquet' (FORMAT parquet)` streams a TimescaleDB chunk
-   straight into a Parquet object without round-tripping rows through Python.
+1. **Federated query** — each measurement is exposed as a view that unions the
+   hot Postgres table with its cold Parquet objects and **dedups by
+   `(time, tag_hash)` keeping the highest `seq`**, so updates are reflected
+   across tiers (write-through appends a new, higher-seq version to cold).
 
-2. **Federated query** — each measurement is exposed as a DuckDB view that
-   `UNION ALL BY NAME`s the hot Postgres table with the cold Parquet objects,
-   so a single SQL statement transparently spans both tiers.
+2. **Compaction** — many small write-through staging objects are merged (and
+   deduped) into large day-partitioned Parquet files.
 
-DuckDB is synchronous, so all execution is dispatched to a thread via
-`asyncio.to_thread`, each call using its own cursor (`con.cursor()`), which
-DuckDB supports for concurrent reads.
-
-The SQL builders below are pure functions (no DuckDB handle) so they can be
-unit-tested without a live engine.
+DuckDB is synchronous, so execution is dispatched to threads; each call uses
+its own cursor. The SQL builders are pure functions for unit-testing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
 
 from .config import settings
 
@@ -35,18 +30,8 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 
-def cold_key(measurement_table: str, range_start: datetime) -> str:
-    """Object key (within the bucket) for a chunk starting at `range_start`.
-
-    The timestamp is normalized to UTC so the key is deterministic regardless
-    of the server's local timezone.
-    """
-    stamp = range_start.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return f"{measurement_table}/{stamp}.parquet"
-
-
-def s3_uri(key: str) -> str:
-    return f"s3://{settings.s3_bucket}/{key}"
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 
 def s3_secret_sql() -> str:
@@ -69,41 +54,55 @@ def attach_pg_sql(alias: str = "pg") -> str:
     return f"ATTACH IF NOT EXISTS '{dsn}' AS {alias} (TYPE postgres, READ_ONLY)"
 
 
-def copy_to_parquet_sql(select_sql: str, key: str) -> str:
-    uri = s3_uri(key)
-    return f"COPY ({select_sql}) TO '{uri}' (FORMAT parquet, COMPRESSION zstd, OVERWRITE_OR_IGNORE true)"
+def read_parquet_ref(uris: list[str]) -> str:
+    """A `read_parquet([...])` relation over the given object URIs.
 
-
-def _quote_ident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def build_view_sql(
-    view_schema: str,
-    measurement_table: str,
-    hot_ref: str | None,
-    cold_keys: list[str],
-) -> str:
-    """Return `CREATE OR REPLACE VIEW` SQL unioning hot + cold for a measurement.
-
-    - `hot_ref` is the fully-qualified attached Postgres relation
-      (e.g. ``pg.lp.cpu``), or None to build a cold-only view.
-    - `cold_keys` are object keys (within the bucket); empty for hot-only.
-
-    Hot and cold snapshots may differ in columns (the live table can gain or
-    widen columns after a chunk was frozen), so `UNION ALL BY NAME` aligns by
-    column name and fills missing columns with NULL.
+    `union_by_name` aligns objects that differ in columns (the live schema can
+    gain/widen columns after older objects were written); missing columns read
+    as NULL.
     """
-    view = f"{_quote_ident(view_schema)}.{_quote_ident(measurement_table)}"
-    parts: list[str] = []
-    if hot_ref:
-        parts.append(f"SELECT * FROM {hot_ref}")
-    if cold_keys:
-        uris = ", ".join(f"'{s3_uri(k)}'" for k in cold_keys)
-        parts.append(f"SELECT * FROM read_parquet([{uris}], union_by_name=true)")
-    # Degenerate case (no hot, no cold): produce an always-empty body.
-    body = "\nUNION ALL BY NAME\n".join(parts) if parts else "SELECT WHERE false"
-    return f"CREATE OR REPLACE VIEW {view} AS {body}"
+    arr = ", ".join(f"'{u}'" for u in uris)
+    return f"read_parquet([{arr}], union_by_name=true)"
+
+
+def build_federated_view_sql(view_schema: str, table: str, refs: list[str]) -> str:
+    """`CREATE OR REPLACE VIEW` that unions `refs` and dedups by
+    `(time, tag_hash)` keeping the newest `seq`. `seq` is excluded from output.
+
+    Every ref must expose `time`, `tag_hash`, and `seq`.
+    """
+    view = f"{_quote_ident(view_schema)}.{_quote_ident(table)}"
+    if not refs:
+        return f"CREATE OR REPLACE VIEW {view} AS SELECT WHERE false"
+    union = "\nUNION ALL BY NAME\n".join(f"SELECT * FROM {r}" for r in refs)
+    return (
+        f"CREATE OR REPLACE VIEW {view} AS\n"
+        f"SELECT * EXCLUDE (seq, _rn) FROM (\n"
+        f"  SELECT *, row_number() OVER "
+        f"(PARTITION BY time, tag_hash ORDER BY seq DESC) AS _rn\n"
+        f"  FROM (\n{union}\n  )\n"
+        f") WHERE _rn = 1"
+    )
+
+
+def compact_sql(input_uris: list[str], output_uri: str) -> str:
+    """`COPY` that merges + dedups staging objects into one compacted object.
+
+    `seq` is retained so cross-object dedup with the hot tier still works on
+    read.
+    """
+    src = read_parquet_ref(input_uris)
+    dedup = (
+        f"SELECT * EXCLUDE (_rn) FROM ("
+        f"  SELECT *, row_number() OVER "
+        f"(PARTITION BY time, tag_hash ORDER BY seq DESC) AS _rn FROM {src}"
+        f") WHERE _rn = 1"
+    )
+    return (
+        f"COPY ({dedup}) TO '{output_uri}' "
+        f"(FORMAT parquet, COMPRESSION zstd, "
+        f"ROW_GROUP_SIZE {settings.cold_row_group_size}, OVERWRITE_OR_IGNORE true)"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -158,32 +157,34 @@ class DuckEngine:
 
         return await asyncio.to_thread(_run)
 
-    async def export_range(
-        self,
-        qualified_hot: str,
-        key: str,
-        range_start: datetime,
-        range_end: datetime,
-    ) -> int:
-        """Export `[range_start, range_end)` from a hot relation to Parquet.
-
-        Returns the number of rows written.
-        """
-        select_sql = (
-            f"SELECT * FROM {qualified_hot} "
-            f"WHERE time >= TIMESTAMPTZ '{range_start.isoformat()}' "
-            f"AND time < TIMESTAMPTZ '{range_end.isoformat()}'"
-        )
+    async def register_views(self, specs: dict[str, list[str]]) -> None:
+        """Create/refresh federated views. `specs` maps table -> [relation refs]."""
         async with self._lock:
-            await self.execute(copy_to_parquet_sql(select_sql, key))
-            rows = await self.query_rows(f"SELECT count(*) AS n FROM read_parquet('{s3_uri(key)}')")
+            for table, refs in specs.items():
+                await self.execute(build_federated_view_sql(settings.tsdb_schema, table, refs))
+
+    async def compact(self, input_uris: list[str], output_uri: str) -> int:
+        """Merge+dedup `input_uris` into `output_uri`. Returns rows written."""
+        async with self._lock:
+            await self.execute(compact_sql(input_uris, output_uri))
+            rows = await self.query_rows(f"SELECT count(*) AS n FROM read_parquet('{output_uri}')")
         return int(rows[0]["n"]) if rows else 0
 
-    async def register_views(self, views: dict[str, tuple[str | None, list[str]]]) -> None:
-        """Create/refresh federated views.
+    async def export_hot_range(self, hot_ref: str, output_uri: str, start, end) -> int:
+        """Export `[start, end)` from a hot relation to a Parquet object.
 
-        `views` maps measurement_table -> (hot_ref_or_None, [cold_keys]).
+        Used to evict chunks that aren't already in cold (e.g. write-through
+        was disabled). Returns rows written.
         """
+        select = (
+            f"SELECT * FROM {hot_ref} "
+            f"WHERE time >= TIMESTAMPTZ '{start.isoformat()}' "
+            f"AND time < TIMESTAMPTZ '{end.isoformat()}'"
+        )
         async with self._lock:
-            for table, (hot_ref, cold_keys) in views.items():
-                await self.execute(build_view_sql(settings.tsdb_schema, table, hot_ref, cold_keys))
+            await self.execute(
+                f"COPY ({select}) TO '{output_uri}' "
+                f"(FORMAT parquet, COMPRESSION zstd, OVERWRITE_OR_IGNORE true)"
+            )
+            rows = await self.query_rows(f"SELECT count(*) AS n FROM read_parquet('{output_uri}')")
+        return int(rows[0]["n"]) if rows else 0

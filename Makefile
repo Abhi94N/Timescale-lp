@@ -1,4 +1,4 @@
-.PHONY: help up down reset logs ps restart rebuild test lint fmt fmt-check dev write query tier tier-status query-all
+.PHONY: help up down reset logs ps restart rebuild test lint fmt fmt-check dev write query tier tier-status query-all loadtest
 
 help:
 	@echo "Targets:"
@@ -15,8 +15,9 @@ help:
 	@echo "  write       - send a sample line-protocol payload"
 	@echo "  query       - run a sample SQL query (hot tier)"
 	@echo "  query-all   - sample query across hot + cold (federated)"
-	@echo "  tier        - force a tiering pass (older_than 1 hour)"
+	@echo "  tier        - force a compaction + eviction pass (older_than 1 hour)"
 	@echo "  tier-status - show the cold-storage manifest summary"
+	@echo "  loadtest    - run the synthetic load generator (a few million rows)"
 
 up:
 	docker compose up -d --build
@@ -71,3 +72,8 @@ query-all:
 	curl -fsS -X POST 'http://localhost:8080/api/v1/query?tier=all' \
 	  -H 'content-type: application/json' \
 	  -d '{"sql":"SELECT count(*) AS n FROM lp.cpu"}'
+
+# Synthetic load test (a few million rows) against the running stack.
+loadtest:
+	docker compose exec ingest python scripts/loadgen.py \
+	  --rows 2000000 --series 2000 --batch 10000 --concurrency 32 --verify

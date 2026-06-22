@@ -22,14 +22,25 @@ class Settings(BaseSettings):
 
     # --- Tiered storage (hot = TimescaleDB, cold = Parquet on S3/MinIO) ---
     # Data whose chunk is entirely older than this window is eligible to be
-    # moved out of TimescaleDB into Parquet objects.
+    # evicted from TimescaleDB (the data already lives in cold via write-through).
     tier_hot_window: str = "7 days"
-    # Background tierer (in-process). Off by default; the manual
-    # POST /api/v1/tier/run endpoint works regardless.
+    # Background maintenance loop (compaction + eviction). Off by default; the
+    # manual POST /api/v1/tier/run endpoint works regardless.
     tier_enabled: bool = False
     tier_interval_seconds: int = 3600
     # Enables the DuckDB-backed federated query path (tier=all / tier=cold).
     query_engine_enabled: bool = True
+
+    # --- Write-through cache ---
+    # When on, every flushed batch is durably written to BOTH TimescaleDB and a
+    # cold-staging Parquet object before the write is acknowledged. Cold storage
+    # is then the source of truth and TimescaleDB is a fully-evictable cache.
+    write_through: bool = True
+    # Compaction merges many small staging objects into large day-partitioned
+    # Parquet files. Target size (bytes) and the row-group size for those files.
+    cold_compact_target_bytes: int = 256 * 1024 * 1024
+    cold_row_group_size: int = 128 * 1024
+    # Federated reads dedup by (time, tag_hash) keeping the newest seq.
 
     # S3 / MinIO (S3-compatible) cold object store.
     s3_endpoint: str = "http://minio:9000"
