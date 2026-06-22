@@ -190,6 +190,68 @@ to a `BETWEEN` over the dashboard's time picker.
 
 ---
 
+## Type handling — line protocol → TimescaleDB columns
+
+The ingest service is **schemaless on input** but materializes **typed
+columns** on the underlying hypertables. The mapping is deterministic.
+
+### 1. Line protocol → Python (parsing)
+
+| Line protocol value     | Example         | Parsed Python type |
+| ----------------------- | --------------- | ------------------ |
+| `<n>i`                  | `count=3i`      | `int`              |
+| `<n>u`                  | `count=3u`      | `int`              |
+| Numeric, suffix-free    | `value=12`      | `float`            |
+| Decimal                 | `value=1.5`     | `float`            |
+| `t` / `true` …          | `ok=true`       | `bool`             |
+| `f` / `false` …         | `ok=false`      | `bool`             |
+| Quoted string           | `msg="hi"`      | `str`              |
+
+### 2. Python → Postgres column type (first sight)
+
+| Python type | Postgres column type |
+| ----------- | -------------------- |
+| `bool`      | `BOOLEAN`            |
+| `int`       | `BIGINT`             |
+| `float`     | `DOUBLE PRECISION`   |
+| `str`       | `TEXT`               |
+
+**Tags are always `TEXT`.**
+
+### 3. Type widening (auto-promotion)
+
+If a field column already exists but a newer point would not fit, the
+column is **promoted up a strict lattice**:
+
+```
+BOOLEAN  <  BIGINT  <  DOUBLE PRECISION  <  TEXT
+```
+
+The promotion runs as `ALTER TABLE ... ALTER COLUMN ... TYPE ... USING ...`
+in the same transaction that adds other columns for the batch.
+
+| Existing column type | New value          | Action                                                        |
+| -------------------- | ------------------ | ------------------------------------------------------------- |
+| `BIGINT`             | `1.5` (float)      | Promote to `DOUBLE PRECISION` (`USING col::double precision`) |
+| `BIGINT`             | `"hello"` (string) | Promote to `TEXT` (`USING col::text`)                         |
+| `BOOLEAN`            | `42` (int)         | Promote to `BIGINT` (`USING col::int::bigint`)                |
+| `DOUBLE PRECISION`   | `42` (int)         | No change — int fits, coerced to `42.0`                       |
+| `TEXT`               | anything           | No change — value coerced to `str(...)`                       |
+
+Properties: promotions are **monotonic** (never demote), `TEXT` is
+**sticky**, the **widest sample in a batch** drives a single promotion
+before COPY, and the change runs under the per-measurement lock. Cost:
+`ALTER COLUMN ... TYPE` rewrites every chunk for the table, so treat
+promotions on large measurements as a real operation. To opt out (enforce
+a strict schema), pre-create the hypertable + columns and the service will
+use them as-is. Promotions are visible in the ingest logs:
+
+```
+... INFO app.store widening cpu.f_value: BIGINT -> DOUBLE PRECISION (line-protocol promotion)
+```
+
+---
+
 ## Building the ingest service image standalone
 
 The microservice has its own multi-stage Dockerfile at

@@ -79,6 +79,34 @@ def _infer_field_type(value: object) -> str:
     return "TEXT"
 
 
+# Type-widening lattice: when a field column already exists but a newly
+# observed value is "wider" than the column type, the column is promoted up
+# this lattice. TEXT is sticky — once a field has been promoted to TEXT it
+# never widens again, and all subsequent values are coerced to str.
+#
+#   BOOLEAN  <  BIGINT  <  DOUBLE PRECISION  <  TEXT
+TYPE_RANK = {"BOOLEAN": 1, "BIGINT": 2, "DOUBLE PRECISION": 3, "TEXT": 4}
+
+
+def _widened_type(current: str, observed: object) -> str:
+    """Return the column type that can hold both the current type and `observed`."""
+    new_t = _infer_field_type(observed)
+    return new_t if TYPE_RANK.get(new_t, 4) > TYPE_RANK.get(current, 4) else current
+
+
+def _alter_using(col: str, from_type: str, to_type: str) -> str:
+    """Return a `USING` expression for `ALTER COLUMN ... TYPE ...`.
+
+    BOOLEAN -> numeric needs to chain through int because Postgres has no
+    direct bool->numeric assignment cast.
+    """
+    qcol = _quote_ident(col)
+    target = to_type.lower()
+    if from_type == "BOOLEAN" and to_type in ("BIGINT", "DOUBLE PRECISION"):
+        return f"({qcol})::int::{target}"
+    return f"({qcol})::{target}"
+
+
 def _hash_tags(tags: dict[str, str]) -> int:
     """Stable 63-bit signed hash of a tag set, used as the dedup/upsert key."""
     if not tags:
@@ -135,10 +163,18 @@ class Store:
         field_samples: dict[str, object],
     ) -> TableSchema:
         cached = self._schema_cache.get(measurement)
+
+        def _wider_needed(name: str, value: object) -> bool:
+            if cached is None or name not in cached.field_cols:
+                return False
+            current = cached.field_cols[name][1]
+            return _widened_type(current, value) != current
+
         needs_update = (
             cached is None
             or any(t not in cached.tag_cols for t in tag_names)
             or any(f not in cached.field_cols for f in field_samples)
+            or any(_wider_needed(f, v) for f, v in field_samples.items())
         )
         if not needs_update and cached is not None:
             return cached
@@ -150,8 +186,16 @@ class Store:
 
             missing_tags = [t for t in tag_names if t not in cached.tag_cols]
             missing_fields = [f for f in field_samples if f not in cached.field_cols]
+            widen: list[tuple[str, str, str, str]] = []  # (field, col, from_type, to_type)
+            for f, v in field_samples.items():
+                if f not in cached.field_cols:
+                    continue
+                col, current = cached.field_cols[f]
+                target = _widened_type(current, v)
+                if target != current:
+                    widen.append((f, col, current, target))
 
-            if missing_tags or missing_fields:
+            if missing_tags or missing_fields or widen:
                 async with self.pool.acquire() as conn, conn.transaction():
                     for t in missing_tags:
                         col = _tag_col(t)
@@ -168,6 +212,20 @@ class Store:
                             f"ADD COLUMN IF NOT EXISTS {_quote_ident(col)} {ftype}"
                         )
                         cached.field_cols[f] = (col, ftype)
+                    for fname, col, from_t, to_t in widen:
+                        log.info(
+                            "widening %s.%s: %s -> %s (line-protocol promotion)",
+                            cached.measurement,
+                            col,
+                            from_t,
+                            to_t,
+                        )
+                        using = _alter_using(col, from_t, to_t)
+                        await conn.execute(
+                            f"ALTER TABLE {cached.qualified} "
+                            f"ALTER COLUMN {_quote_ident(col)} TYPE {to_t} USING {using}"
+                        )
+                        cached.field_cols[fname] = (col, to_t)
             self._schema_cache[measurement] = cached
             return cached
 
@@ -273,11 +331,18 @@ class Store:
 
     async def _write_measurement(self, measurement: str, points: list[Point]) -> int:
         tag_names: set[str] = set()
+        # Per field, retain the value whose inferred type sits highest in the
+        # widening lattice — this is the value `_ensure_schema` uses to decide
+        # whether to add or widen the column.
         field_samples: dict[str, object] = {}
         for p in points:
             tag_names.update(p.tags)
             for k, v in p.fields.items():
-                field_samples.setdefault(k, v)
+                existing = field_samples.get(k)
+                if existing is None or TYPE_RANK.get(_infer_field_type(v), 4) > TYPE_RANK.get(
+                    _infer_field_type(existing), 4
+                ):
+                    field_samples[k] = v
 
         schema = await self._ensure_schema(measurement, tag_names, field_samples)
 
